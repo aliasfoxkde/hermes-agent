@@ -126,6 +126,31 @@ from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
 
+# Outcome Memory — ChromaDB + ONNX persistent knowledge (lazy-loaded)
+# Points to ~/repos/backend/src/ which has the ONNX model + dependencies.
+try:
+    BACKEND_HOME = str(Path(__file__).parent.parent / "repos" / "backend")
+    _om_path = str(Path.home() / ".hermes" / "lib")
+    if _om_path not in sys.path:
+        sys.path.insert(0, _om_path)
+    from hermes_outcome_memory.hermes_integration import OutcomeMemoryInjector, _get_injector
+except Exception:
+    OutcomeMemoryInjector = None
+    _get_injector = None
+
+# Hermes Core: self-evolution, enforcement, quality gates (lazy import — non-fatal)
+try:
+    from hermes_core.enforcement.zero_tolerance import get_zero_tolerance_enforcement
+except Exception:
+    get_zero_tolerance_enforcement = None
+
+# Hermes Core Integration Layer — wires hermes_core into the agent loop
+# See hermes_core/integration.py for philosophy and integration points.
+try:
+    from hermes_core import integration as _hermes_core_integration
+except Exception:
+    _hermes_core_integration = None
+
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
@@ -271,6 +296,12 @@ def _install_safe_stdio() -> None:
 class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
+    Supports three modes (set via iteration_mode parameter):
+    - "budgeted" (default): Fixed iteration cap (max_total). Traditional behavior.
+    - "unlimited": No hard cap. Runs until the model returns a final response.
+    - "plan_completion": Unlimited. Also stops early if all todo items are
+      completed or cancelled (plan fully done), regardless of iteration count.
+
     Each agent (parent or subagent) gets its own ``IterationBudget``.
     The parent's budget is capped at ``max_iterations`` (default 90).
     Each subagent gets an independent budget capped at
@@ -281,20 +312,73 @@ class IterationBudget:
 
     ``execute_code`` (programmatic tool calling) iterations are refunded via
     :meth:`refund` so they don't eat into the budget.
+
+    When iteration_mode is "unlimited" or "plan_completion", max_total is
+    ignored for consume() decisions (always returns True). It is still
+    used for progress display and backward-compatibility signals.
     """
 
-    def __init__(self, max_total: int):
+    def __init__(self, max_total: int, iteration_mode: str = "budgeted"):
+        """
+        Args:
+            max_total: Hard cap for budgeted mode. Used for progress display
+                in all modes.
+            iteration_mode: "budgeted" | "unlimited" | "plan_completion".
+                Defaults to "budgeted" for backward compatibility.
+        """
         self.max_total = max_total
         self._used = 0
         self._lock = threading.Lock()
+        self._mode = iteration_mode if iteration_mode in (
+            "budgeted", "unlimited", "plan_completion"
+        ) else "budgeted"
+
+    @property
+    def mode(self) -> str:
+        """Current iteration mode."""
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        """Dynamically switch iteration mode (e.g. from CLI /steer)."""
+        if mode in ("budgeted", "unlimited", "plan_completion"):
+            self._mode = mode
 
     def consume(self) -> bool:
         """Try to consume one iteration.  Returns True if allowed."""
+        if self._mode in ("unlimited", "plan_completion"):
+            # No hard cap — always allow
+            with self._lock:
+                self._used += 1
+            return True
         with self._lock:
             if self._used >= self.max_total:
                 return False
             self._used += 1
             return True
+
+    def is_exhausted(self, todo_store=None) -> bool:
+        """
+        Return True when the budget is consumed and the loop should exit.
+
+        In budgeted mode: True when used >= max_total.
+        In unlimited mode: Always False (never exhausted).
+        In plan_completion mode: True when todo_store reports is_plan_complete(),
+        or when used >= max_total as a safety floor.
+        """
+        if self._mode == "unlimited":
+            return False
+        with self._lock:
+            used = self._used
+        if self._mode == "plan_completion":
+            if todo_store is not None and todo_store.is_plan_complete():
+                return True
+            # Safety floor: if we somehow have a max_total set to a reasonable
+            # bound, still respect it as a hard ceiling in plan_completion mode
+            if self.max_total > 0 and used >= self.max_total:
+                return True
+            return False
+        # budgeted
+        return used >= self.max_total
 
     def refund(self) -> None:
         """Give back one iteration (e.g. for execute_code turns)."""
@@ -309,7 +393,14 @@ class IterationBudget:
     @property
     def remaining(self) -> int:
         with self._lock:
+            if self._mode in ("unlimited", "plan_completion"):
+                return 999999  # Effectively infinite
             return max(0, self.max_total - self._used)
+
+    @property
+    def unlimited(self) -> bool:
+        """True when mode is unlimited or plan_completion."""
+        return self._mode in ("unlimited", "plan_completion")
 
 
 # Tools that must never run concurrently (interactive / user-facing).
@@ -905,6 +996,7 @@ class AIAgent:
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        iteration_mode: str = "budgeted",  # "budgeted" | "unlimited" | "plan_completion"
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -1008,7 +1100,9 @@ class AIAgent:
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
-        self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+        self.iteration_budget = iteration_budget or IterationBudget(
+            max_iterations, iteration_mode=iteration_mode
+        )
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
@@ -1693,6 +1787,18 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+
+        # Outcome Memory injector — lazily loads VKB + WorkingMemory + ONNX embeddings
+        # from the backend repo. Non-fatal if unavailable.
+        self._outcome_memory_injector = None
+        if OutcomeMemoryInjector is not None:
+            try:
+                self._outcome_memory_injector = OutcomeMemoryInjector(
+                    hermes_home=str(_hermes_home),
+                    backend_home=BACKEND_HOME,
+                )
+            except Exception:
+                pass
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -4622,6 +4728,13 @@ class AIAgent:
                     self.session_id or "",
                     messages or [],
                 )
+            except Exception:
+                pass
+
+        # === Hermes Core: shutdown integration at actual session end ===
+        if _hermes_core_integration is not None:
+            try:
+                _hermes_core_integration.shutdown()
             except Exception:
                 pass
 
@@ -9732,6 +9845,24 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            # === Hermes Core Quality Gates: non-blocking check after file-write tools ===
+            if _hermes_core_integration is not None:
+                try:
+                    _qg_result = _hermes_core_integration.on_tool_result(
+                        name, function_result,
+                        {"path": args.get("path")} if name in ("write_file", "patch") else args
+                    )
+                    if _qg_result and _qg_result.get("gate_results"):
+                        for _gr in _qg_result["gate_results"]:
+                            if _gr.get("severity") in ("critical", "high"):
+                                logger.warning(
+                                    "[HermesCore quality] %s [%s] %s: %s",
+                                    name, _gr["gate"], _gr["message"],
+                                    args.get("path", ""),
+                                )
+                except Exception:
+                    pass
+
             # ── Per-tool /steer drain ───────────────────────────────────
             # Same as the sequential path: drain between each collected
             # result so the steer lands as early as possible.
@@ -10060,6 +10191,15 @@ class AIAgent:
                 function_result[:200] if len(function_result) > 200 else function_result
             )
 
+            # Outcome Memory: capture skill/pattern/insight outcomes after tool execution
+            if self._outcome_memory_injector is not None:
+                try:
+                    self._outcome_memory_injector.capture_tool_outcome(
+                        function_name, function_args, function_result,
+                    )
+                except Exception:
+                    pass
+
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
@@ -10119,6 +10259,51 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            # === Hermes Core Quality Gates: non-blocking check after file-write tools ===
+            if _hermes_core_integration is not None:
+                try:
+                    _qg_result = _hermes_core_integration.on_tool_result(
+                        function_name, function_result, function_args
+                    )
+                    if _qg_result and _qg_result.get("gate_results"):
+                        for _gr in _qg_result["gate_results"]:
+                            if _gr.get("severity") in ("critical", "high"):
+                                logger.warning(
+                                    "[HermesCore quality] %s [%s] %s: %s",
+                                    function_name, _gr["gate"], _gr["message"],
+                                    function_args.get("path", ""),
+                                )
+                except Exception:
+                    pass
+
+            # === Hermes Core Self-Healing: auto-fix code execution errors ===
+            # If execute_code returned an error, attempt to classify and fix it.
+            if (
+                _hermes_core_integration is not None
+                and function_name == "execute_code"
+                and _is_error_result
+            ):
+                try:
+                    # Try to extract code from args
+                    _code = function_args.get("code", "")
+                    if _code:
+                        _fixed, _fixed_code, _verify_result = _hermes_core_integration.on_code_error(
+                            _code,
+                            function_result[:500],  # first 500 chars of error
+                            function_args.get("path"),
+                        )
+                        if _fixed and _fixed_code:
+                            logger.info(
+                                "[HermesCore self-heal] execute_code auto-fixed: %s",
+                                _verify_result.get("message", "")[:200] if _verify_result else "",
+                            )
+                            # Note: we log the fix but don't auto-submit because
+                            # modifying the tool result after appending would require
+                            # re-construction of the messages list. The agent sees
+                            # the fix info via the tool result and can re-execute.
+                except Exception:
+                    pass
+
             # ── Per-tool /steer drain ───────────────────────────────────
             # Drain pending steer BETWEEN individual tool calls so the
             # injection lands as soon as a tool finishes — not after the
@@ -10164,7 +10349,16 @@ class AIAgent:
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
-        print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
+        _mode = self.iteration_budget.mode
+        if _mode == "plan_completion":
+            _plan = self._todo_store
+            _done = _plan.completed_count() if _plan.has_items() else 0
+            _total = len(_plan.read()) if _plan.has_items() else 0
+            print(f"✅ Plan complete ({_done}/{_total} tasks done, {api_call_count} iterations). Requesting summary...")
+        elif _mode == "unlimited":
+            print(f"ℹ️  Iteration cap reached ({api_call_count} calls, unlimited mode). Requesting summary...")
+        else:
+            print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
 
         summary_request = (
             "You've reached the maximum number of tool-calling iterations allowed. "
@@ -10387,6 +10581,13 @@ class AIAgent:
 
         self._ensure_db_session()
 
+        # Initialize Hermes Core systems for this session (lazy, non-fatal)
+        if _hermes_core_integration is not None:
+            try:
+                _hermes_core_integration.init_session(self.session_id)
+            except Exception:
+                pass
+
         # Tag all log records on this thread with the session ID so
         # ``hermes logs --session <id>`` can filter a single conversation.
         from hermes_logging import set_session_context
@@ -10455,7 +10656,10 @@ class AIAgent:
         # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
         # They are initialized in __init__ and must persist across run_conversation
         # calls so that nudge logic accumulates correctly in CLI mode.
-        self.iteration_budget = IterationBudget(self.max_iterations)
+        self.iteration_budget = IterationBudget(
+            self.max_iterations, iteration_mode=self.iteration_budget.mode
+            if getattr(self.iteration_budget, "mode", "budgeted") else "budgeted"
+        )
 
         # Log conversation turn start for debugging/observability
         _preview_text = _summarize_user_message_for_log(user_message)
@@ -10723,7 +10927,17 @@ class AIAgent:
             except Exception:
                 pass
 
-        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+        # Outcome Memory: prefetch relevant context before the API loop
+        # so the model sees lessons/patterns from prior sessions.
+        if self._outcome_memory_injector is not None:
+            try:
+                self._outcome_memory_injector.on_turn_start(original_user_message)
+            except Exception:
+                pass
+
+        while (api_call_count < self.max_iterations
+               and not self.iteration_budget.is_exhausted(self._todo_store)) \
+               or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -10734,7 +10948,7 @@ class AIAgent:
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
-            
+
             api_call_count += 1
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")
@@ -10745,9 +10959,22 @@ class AIAgent:
             if self._budget_grace_call:
                 self._budget_grace_call = False
             elif not self.iteration_budget.consume():
+                _reason = ""
+                if self.iteration_budget.mode == "plan_completion":
+                    _plan = self._todo_store
+                    _done = _plan.completed_count() if _plan.has_items() else 0
+                    _total = len(_plan.read()) if _plan.has_items() else 0
+                    _reason = f" — all planned tasks complete ({_done}/{_total} done)"
+                elif self.iteration_budget.mode == "unlimited":
+                    _reason = " (unlimited mode)"
                 _turn_exit_reason = "budget_exhausted"
                 if not self.quiet_mode:
-                    self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+                    _budget_info = (
+                        f"{self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used{_reason}"
+                        if self.iteration_budget.mode == "budgeted"
+                        else f"{self.iteration_budget.used} iterations used{_reason}"
+                    )
+                    self._safe_print(f"\n⚠️  Iteration budget exhausted ({_budget_info})")
                 break
 
             # Fire step_callback for gateway hooks (agent:step event)
@@ -10869,6 +11096,16 @@ class AIAgent:
                             _injections.append(_fenced)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
+                    # Outcome Memory: inject relevant lessons/patterns from prior sessions
+                    if self._outcome_memory_injector is not None:
+                        try:
+                            _om_injected = self._outcome_memory_injector.inject_into_user_message(
+                                api_msg, idx, current_turn_user_idx,
+                            )
+                            if _om_injected:
+                                _injections.append("[outcome_memory: injected]")
+                        except Exception:
+                            pass
                     if _injections:
                         _base = api_msg.get("content", "")
                         if isinstance(_base, str):
@@ -10995,7 +11232,11 @@ class AIAgent:
             thinking_spinner = None
             
             if not self.quiet_mode:
-                self._vprint(f"\n{self.log_prefix}🔄 Making API call #{api_call_count}/{self.max_iterations}...")
+                self._vprint(
+                    f"\n{self.log_prefix}🔄 Making API call #{api_call_count}"
+                    + (f"/{self.max_iterations}" if self.iteration_budget.mode == "budgeted" else "")
+                    + "..."
+                )
                 self._vprint(f"{self.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
                 self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
             else:
@@ -11170,7 +11411,22 @@ class AIAgent:
                         response = self._interruptible_api_call(api_kwargs)
                     
                     api_duration = time.time() - api_start_time
-                    
+                    _api_call_success = True
+                    _api_call_error = ""
+
+                    # === Hermes Core Health Monitor: track API latency + circuit breaker ===
+                    if _hermes_core_integration is not None and self.provider:
+                        try:
+                            _provider_key = f"{self.provider}:{self.model}"
+                            _hermes_core_integration.on_api_call(
+                                _provider_key,
+                                api_duration * 1000,  # ms
+                                success=True,
+                                error="",
+                            )
+                        except Exception:
+                            pass
+
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.
                     if thinking_spinner:
@@ -13653,8 +13909,10 @@ class AIAgent:
                 # message pollutes history, burns tokens, and risks violating
                 # role-alternation invariants.
 
-                # If we're near the limit, break to avoid infinite loops
-                if api_call_count >= self.max_iterations - 1:
+                # If we're near the limit, break to avoid infinite loops.
+                # Skip in unlimited/plan_completion modes (no hard cap).
+                if (self.iteration_budget.mode == "budgeted"
+                        and api_call_count >= self.max_iterations - 1):
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                     # Append as assistant so the history stays valid for
@@ -13662,10 +13920,7 @@ class AIAgent:
                     messages.append({"role": "assistant", "content": final_response})
                     break
         
-        if final_response is None and (
-            api_call_count >= self.max_iterations
-            or self.iteration_budget.remaining <= 0
-        ):
+        if final_response is None and self.iteration_budget.is_exhausted(self._todo_store):
             # Budget exhausted — ask the model for a summary via one extra
             # API call with tools stripped.  _handle_max_iterations injects a
             # user message and makes a single toolless request.
@@ -13860,6 +14115,41 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # Flush Outcome Memory WorkingMemory → VKB on session end
+        if self._outcome_memory_injector is not None:
+            try:
+                self._outcome_memory_injector.flush()
+            except Exception:
+                pass
+
+        # === Zero-Tolerance Enforcement: validate final_response before returning ===
+        # Non-blocking: logs warnings but never blocks a response.
+        # Uses hermes_core integration for consistent enforcement across all checks.
+        if (
+            _hermes_core_integration is not None
+            and final_response
+            and self.session_id
+        ):
+            try:
+                _allowed, _violations, _warnings = _hermes_core_integration.enforce_output(final_response)
+                for _v in _violations:
+                    logger.warning(
+                        "[HermesCore enforcement] %s [%s] line=%s: %s",
+                        self.session_id[:8],
+                        _v.get("gate", "unknown"),
+                        _v.get("line", "?"),
+                        _v.get("message", ""),
+                    )
+                for _w in _warnings:
+                    logger.info(
+                        "[HermesCore enforcement] %s [warning] %s: %s",
+                        self.session_id[:8],
+                        _w.get("gate", "unknown"),
+                        _w.get("message", ""),
+                    )
+            except Exception:
+                pass  # Never let enforcement block a response
 
         return result
 

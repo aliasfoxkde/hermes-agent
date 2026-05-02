@@ -1,0 +1,1 @@
+"""Hermes Core patterns package."""

@@ -1,0 +1,1 @@
+"""Hermes Core scaffolding package."""
